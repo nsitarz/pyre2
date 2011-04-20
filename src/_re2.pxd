@@ -97,8 +97,8 @@ cdef extern from "re2/re2.h" namespace "re2":
     cdef cppclass RE2:
         RE2(const_StringPiece pattern, Options option)
         RE2(const_StringPiece pattern)
-        int Match(const_StringPiece text, int startpos, Anchor anchor,
-                   StringPiece * match, int nmatch) nogil
+        int Match(const_StringPiece text, int startpos, int endpost, 
+                    Anchor anchor, StringPiece * match, int nmatch) nogil
         int NumberOfCapturingGroups()
         int ok()
         const_string pattern()

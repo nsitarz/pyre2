@@ -413,7 +413,7 @@ cdef class Pattern:
 
         sp = new _re2.StringPiece(cstring, size)
         with nogil:
-            result = self.re_pattern.Match(sp[0], <int>pos, anchoring, m.matches, self.ngroups + 1)
+            result = self.re_pattern.Match(sp[0], <int>pos, <int>size, anchoring, m.matches, self.ngroups + 1)
 
         del sp
         if result == 0:
@@ -473,7 +473,7 @@ cdef class Pattern:
         while True:
             m = Match(self, self.ngroups + 1)
             with nogil:
-                result = self.re_pattern.Match(sp[0], <int>pos, _re2.UNANCHORED, m.matches, self.ngroups + 1)
+                result = self.re_pattern.Match(sp[0], <int>pos, <int>size, _re2.UNANCHORED, m.matches, self.ngroups + 1)
             if result == 0:
                 break
             m.encoded = encoded
@@ -535,37 +535,37 @@ cdef class Pattern:
         cdef Match m
         cdef list resultlist = []
         cdef int encoded = 0
-
+        
         if maxsplit < 0:
             maxsplit = 0
-
+        
         string = unicode_to_bytestring(string, &encoded)
         if pystring_to_bytestring(string, &cstring, &size) == -1:
             raise TypeError("expected string or buffer")
-
+        
         encoded = <bint>encoded
-
+        
         matches = _re2.new_StringPiece_array(self.ngroups + 1)
         sp = new _re2.StringPiece(cstring, size)
-
+        
         while True:
             with nogil:
-                result = self.re_pattern.Match(sp[0], <int>(pos + lookahead), _re2.UNANCHORED, matches, self.ngroups + 1)
+                result = self.re_pattern.Match(sp[0], <int>(pos + lookahead), <int>size, _re2.UNANCHORED, matches, self.ngroups + 1)
             if result == 0:
                 break
-
+        
             match_start = matches[0].data() - cstring
             match_end = match_start + matches[0].length()
-
+        
             # If an empty match, just look ahead until you find something
             if match_start == match_end:
                 if pos + lookahead == size:
                     break
                 lookahead += 1
                 continue
-
+        
             if encoded:
-                resultlist.append(char_to_utf8(&sp.data()[pos], match_start - pos))
+                resultlist.append(char_to_utf8(<_re2.const_char_ptr>&sp.data()[pos], match_start - pos))
             else:
                 resultlist.append(sp.data()[pos:match_start])
             if self.ngroups > 0:
