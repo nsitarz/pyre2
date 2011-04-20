@@ -577,17 +577,17 @@ cdef class Pattern:
                             resultlist.append(char_to_utf8(matches[group + 1].data(), matches[group + 1].length()))
                         else:
                             resultlist.append(matches[group + 1].data()[:matches[group + 1].length()])
-
+        
             # offset the pos to move to the next point
             pos = match_end
             lookahead = 0
-
+        
             num_split += 1
             if maxsplit and num_split >= maxsplit:
                 break
-
+        
         if encoded:
-            resultlist.append(char_to_utf8(&sp.data()[pos], sp.length() - pos))
+            resultlist.append(char_to_utf8(<_re2.const_char_ptr>&sp.data()[pos], sp.length() - pos))
         else:
             resultlist.append(sp.data()[pos:])
         _re2.delete_StringPiece_array(matches)
@@ -716,7 +716,7 @@ cdef class Pattern:
             while True:
                 m = Match(self, self.ngroups + 1)
                 with nogil:
-                    result = self.re_pattern.Match(sp[0], <int>pos, _re2.UNANCHORED, m.matches, self.ngroups + 1)
+                    result = self.re_pattern.Match(sp[0], <int>pos, <int>size, _re2.UNANCHORED, m.matches, self.ngroups + 1)
                 if result == 0:
                     break
 
