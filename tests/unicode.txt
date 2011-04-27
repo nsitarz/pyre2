@@ -45,7 +45,7 @@ Test unicode character groups
 Group positions need to be fixed with unicode
 
     >>> re.search(r' (.)', u'\U0001d200xxx\u1234 x').span(1) 
-    (6, 7)
+    (7, 8)
     >>> re.search(r' (.)', u'\U0001d200xxx\u1234 x'.encode('utf-8')).span(1) 
     (11, 12)
 
