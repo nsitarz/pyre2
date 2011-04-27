@@ -94,17 +94,36 @@ cdef extern from *:
     cdef void emit_ifndef_py_unicode_wide "#if !defined(Py_UNICODE_WIDE) //" ()
     cdef void emit_endif "#endif //" ()
 
-def convert_position(char* match_string, int position):
-    cdef char * s = match_string
+
+# String position map directions
+BYTE_TO_UNICODE = 0
+UNICODE_TO_BYTE = 1
+
+cpdef dict string_position_map(object match_string, object positions, int dir ):
+    cdef char* s = match_string 
     cdef int cpos = 0
     cdef int upos = 0
     cdef int size = len(match_string)
-    cdef unsigned char c 
+    cdef int c
+    cdef dict new_positions = {}
+    cdef int i = 0
+    cdef int num_positions = len(positions)
 
-    for c in s:
-        if upos == position:
-            break
-        
+    positions = sorted(positions)
+
+    if positions[i] == -1:
+        new_positions[-1] = -1
+        inc(i)
+        if i == num_positions:
+            return new_positions
+    if positions[i] == 0:
+        new_positions[0] = 0
+        inc(i)
+        if i == num_positions:
+            return new_positions
+
+    while cpos < size:
+        c = <unsigned char>s[cpos]
         if c < 0x80:
             inc(cpos)
             inc(upos)
@@ -122,9 +141,21 @@ def convert_position(char* match_string, int position):
             emit_ifndef_py_unicode_wide()
             inc(upos)
             emit_endif()
-            
-    return cpos
-    
+
+        if positions[i] == cpos and dir == BYTE_TO_UNICODE:
+            new_positions[positions[i]] = upos
+            inc(i)
+            if i == num_positions:
+                return new_positions
+
+        elif positions[i] == upos and dir == UNICODE_TO_BYTE:
+            new_positions[positions[i]] = cpos
+            inc(i)
+            if i == num_positions:
+                return new_positions
+
+    assert False, "Not all positions were converted"
+
 cdef class Match:
     cdef _re2.StringPiece * matches
     cdef _re2.const_stringintmap * named_groups
@@ -743,8 +774,9 @@ cdef class MatchIterator:
             raise TypeError("expected string or buffer")
         
         if self.encoded:
-            self.pos = convert_position(self.cstring, pos)
-            self.endpos = convert_position(self.cstring, endpos)
+            encoded_positions = string_position_map(self.cstring, (pos, endpos), UNICODE_TO_BYTE)
+            self.pos = encoded_positions[pos]
+            self.endpos = encoded_positions[endpos]
         else:
             self.pos = pos
             self.endpos = endpos
