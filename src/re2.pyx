@@ -2,6 +2,8 @@
 # Import re flags to be compatible.
 import sys
 import re
+import sre_parse
+import sre_constants
 
 I = re.I
 IGNORECASE = re.IGNORECASE
@@ -849,38 +851,16 @@ def compile(pattern, int flags=0, int max_mem=8388608):
     _cache[cachekey] = p
     return p
 
-class BackreferencesException(Exception):
+class UnsupportedOpcode(Exception):
     pass
 
-WHITESPACE = set(" \t\n\r\v\f")
+class BackreferencesException(UnsupportedOpcode):
+    pass
 
-class Tokenizer:
-    def __init__(self, string):
-        self.string = string
-        self.index = 0
-        self.__next()
-    def __next(self):
-        if self.index >= len(self.string):
-            self.next = None
-            return
-        ch = self.string[self.index]
-        if ch[0] == "\\":
-            try:
-                c = self.string[self.index + 1]
-            except IndexError:
-                raise RegexError, "bogus escape (end of line)"
-            ch = ch + c
-        self.index = self.index + len(ch)
-        self.next = ch
-    def get(self):
-        this = self.next
-        self.__next()
-        return this
 
-def prepare_pattern(pattern, int flags):
-    source = Tokenizer(pattern)
-    new_pattern = []
-
+cpdef object prepare_pattern(object pattern, int flags):
+    cdef list new_pattern = []
+    
     cdef str strflags = ''
     if flags & _S:
         strflags += 's'
@@ -889,75 +869,149 @@ def prepare_pattern(pattern, int flags):
 
     if strflags:
         new_pattern.append('(?' + strflags + ')')
-
-    while 1:
-        this = source.get()
-        if this is None:
-            break
-        if flags & _X:
-            if this in WHITESPACE:
-                continue
-            if this == "#":
-                while 1:
-                    this = source.get()
-                    if this in (None, "\n"):
-                        break
-                continue
+    
+    for opcode, arg in sre_parse.parse(pattern, flags & VERBOSE):
+        new_pattern.extend(handle_op(opcode, arg, flags))
+    
+    return "".join(new_pattern)
         
-        if this[0] not in '[\\':
-            new_pattern.append(this)
-            continue
+cdef list handle_op(object opcode, object arg, int flags):
+    cdef list new_pattern = []
+    
+    if opcode == sre_constants.LITERAL:
+        new_pattern.append(chr(arg))
+    elif opcode == sre_constants.NOT_LITERAL:
+        new_pattern.append(r'^')
+        new_pattern.append(chr(arg))
+    elif opcode == sre_constants.NEGATE:
+        new_pattern.append(r'^')
+    elif opcode == sre_constants.RANGE:
+        new_pattern.append(chr(arg[0]))
+        new_pattern.append('-')
+        new_pattern.append(chr(arg[1]))
+    elif opcode in (sre_constants.MIN_REPEAT, sre_constants.MAX_REPEAT):
+        new_pattern.extend(handle_repeat(opcode, arg, flags))
+    elif opcode == sre_constants.SUBPATTERN:
+        new_pattern.extend(handle_subpattern(arg, flags))
+    elif opcode in (sre_constants.ANY, sre_constants.ANY_ALL):
+        new_pattern.append('.')
+    elif opcode == sre_constants.AT:
+        new_pattern.extend(handle_at(arg, flags))
+    elif opcode == sre_constants.CATEGORY:
+        new_pattern.extend(handle_category(arg, flags))
+    elif opcode == sre_constants.IN:
+        new_pattern.extend(handle_in(arg, flags))
+    elif opcode == sre_constants.BRANCH:
+        new_pattern.extend(handle_branch(arg, flags))
+    else:
+        raise UnsupportedOpcode, "Opcode %s not implemented" % opcode
+    return new_pattern
 
-        elif this == '[':
-            new_pattern.append(this)    
-            while 1:
-                this = source.get()
-                if this is None:
-                    raise RegexError, "unexpected end of regular expression"
-                elif this == ']':
-                    new_pattern.append(this)
-                    break
-                elif this[0] == '\\':
-                    if flags & _U:
-                        if this[1] == 'd':
-                            new_pattern.append(r'\p{Nd}')
-                        elif this[1] == 'w':
-                            new_pattern.append(r'_\p{L}\p{Nd}')
-                        elif this[1] == 's':
-                            new_pattern.append(r'\s\p{Z}')
-                        else:   
-                            new_pattern.append(this)
-                    else:
-                        new_pattern.append(this)
-                else:
-                    new_pattern.append(this)
-        elif this[0] == '\\':
-            if this[1] in '89':
-                raise BackreferencesException()
-            elif this[1] in '1234567':
-                if source.next and source.next in '1234567':
-                    this += source.get()
-                    if source.next and source.next in '1234567':
-                        # all clear, this is an octal escape
-                        new_pattern.append(this)
-                    else:
-                        raise BackreferencesException()
-                else:
-                    raise BackreferencesException()
-            elif flags & _U:
-                if this[1] == 'd':
-                    new_pattern.append(r'\p{Nd}')
-                elif this[1] == 'w':
-                    new_pattern.append(r'[_\p{L}\p{Nd}]')
-                elif this[1] == 's':
-                    new_pattern.append(r'[\s\p{Z}]')
-                else:
-                    new_pattern.append(this)
-            else:
-                new_pattern.append(this)
+cdef list handle_branch(object arg, int flags):
+    cdef list new_pattern = []
+    cdef object alts = arg[1]
+    
+    for subop, subarg in alts:
+        new_pattern.extend(handle_op(subop, subarg, flags))
+        new_pattern.append(r'|')
+    return new_pattern[0:-1]
 
-    return ''.join(new_pattern)
+cdef list handle_repeat(object opcode, object arg, int flags):
+    cdef list new_pattern = []
+    min, max, subpat = arg
+    subop, subarg = subpat
+    
+    for subop, subarg in subpat:
+        new_pattern.extend(handle_op(subop, subarg, flags))
+    if min == 0 and max == 1:
+        new_pattern.append(r'?')
+    elif min == 0 and max == sre_constants.MAXREPEAT:
+        new_pattern.append(r'*')
+    elif min == 1 and max == sre_constants.MAXREPEAT:
+        new_pattern.append(r'+')
+    else:
+        new_pattern.append(r'{%d,%d}' % (min, max))
+    
+    if opcode == sre_constants.MIN_REPEAT:
+        new_pattern.append(r'?')
+    
+    return new_pattern
+    
 
+cdef list handle_subpattern(object arg, int flags):
+    cdef list new_pattern = []
+    emit = new_pattern.append
+    groupnum, subargs = arg
+    for opcode, subarg in subargs:
+        new_pattern.extend(handle_op(opcode, subarg, flags))
+    return new_pattern
+    
+cdef list handle_at(object arg, int flags):
+    cdef list new_pattern = []
+    emit = new_pattern.append
+    if arg in (sre_constants.AT_END_STRING, sre_constants.AT_END_LINE):
+        emit(r'\z')
+    elif arg == sre_constants.AT_END:
+        emit(r'$')
+    elif arg == sre_constants.AT_BEGINNING_STRING:
+        emit(r'\A')
+    elif arg in (sre_constants.AT_BEGINNING, sre_constants.AT_BEGINNING_LINE):
+        emit(r'^')
+    elif arg == sre_constants.AT_BOUNDRY:
+        emit(r'\b')
+    elif arg == sre_constants.AT_NON_BOUNDRY:
+        emit(r'\B')
+    else:
+        assert False, "Unsupported AT: " + arg
+    return new_pattern
+        
+
+cdef list handle_category(object arg, int flags):
+    cdef list new_pattern = []
+    emit = new_pattern.append
+    
+    if arg == sre_constants.CATEGORY_WORD:
+        if flags & _U:
+            emit(r'_\p{L}\p{Nd}')
+        else:
+            emit(r'\w')
+    elif arg == sre_constants.CATEGORY_NOT_WORD:
+        if flags & _U:
+            emit(r'^_\P{L}\P{Nd}')
+        else:
+            emit(r'\W')
+    elif arg == sre_constants.CATEGORY_DIGIT:
+        if flags & _U:
+            emit(r'\p{Nd}')
+        else:
+            emit(r'\d')
+    elif arg == sre_constants.CATEGORY_NOT_DIGIT:
+        if flags & _U:
+            emit(r'\P{Nd}')
+        else:
+            emit(r'\D')
+    elif arg == sre_constants.CATEGORY_SPACE:
+        if flags & _U:
+            emit(r'\s\p{Z}')
+        else:
+            emit(r'\s')
+    elif arg == sre_constants.CATEGORY_NOT_SPACE:
+        if flags & _U:
+            emit(r'\S\P{Z}')
+        else:
+            emit(r'\S')
+    else:
+        assert False, "Category %s not implemented" % arg
+    
+    return new_pattern
+
+cdef list handle_in(object arg, int flags):
+    cdef list new_pattern = []
+    new_pattern.append('[')
+    for opcode, subarg in arg:
+        new_pattern.extend(handle_op(opcode, subarg, flags))
+    new_pattern.append(']')
+    return new_pattern
     
 
 def _compile(pattern, int flags=0, int max_mem=8388608):
@@ -979,8 +1033,8 @@ def _compile(pattern, int flags=0, int max_mem=8388608):
     cdef object original_pattern = pattern
     try:
         pattern = prepare_pattern(original_pattern, flags)
-    except BackreferencesException:
-        error_msg = "Backreferences not supported"
+    except UnsupportedOpcode:
+        error_msg = "Unsupported Opcode"
         if current_notification == <int>FALLBACK_EXCEPTION:
             # Raise an exception regardless of the type of error.
             raise RegexError(error_msg)
