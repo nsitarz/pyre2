@@ -858,71 +858,124 @@ class BackreferencesException(UnsupportedOpcode):
     pass
 
 
-cpdef object prepare_pattern(object pattern, int flags):
+cpdef object prepare_pattern(object pattern_string, int flags):
     cdef list new_pattern = []
+    
+    try:
+        pattern_list = sre_parse.parse(pattern_string, flags & VERBOSE)
+    except sre_parse.error, e:
+        raise RegexError(e)
+        
+    pattern = pattern_list.pattern
+    pattern.reverse_groupdict = dict(zip(pattern.groupdict.values(), pattern.groupdict.keys()))
+    pattern.is_unicode = type(pattern_string) == unicode
+    
+    #Check for flags set in the pattern string
+    flags = flags | pattern.flags
     
     cdef str strflags = ''
     if flags & _S:
         strflags += 's'
     if flags & _M:
         strflags += 'm'
+    if flags & _I:
+        strflags += 'i'
 
     if strflags:
         new_pattern.append('(?' + strflags + ')')
     
-    for opcode, arg in sre_parse.parse(pattern, flags & VERBOSE):
-        new_pattern.extend(handle_op(opcode, arg, flags))
+    for opcode, arg in pattern_list:
+        new_pattern.extend(handle_op(pattern, opcode, arg, flags))
     
-    return "".join(new_pattern)
+    result = "".join(new_pattern)
+    
+    if pattern.is_unicode:
+        return unicode(result)
+    else:
+        return result
         
-cdef list handle_op(object opcode, object arg, int flags):
+cdef list handle_op(object pattern, object opcode, object arg, int flags):
     cdef list new_pattern = []
     
     if opcode == sre_constants.LITERAL:
-        new_pattern.append(chr(arg))
+        if pattern.is_unicode:
+            new_pattern.append(unichr(arg))
+        else:
+            new_pattern.append(chr(arg))
     elif opcode == sre_constants.NOT_LITERAL:
-        new_pattern.append(r'^')
-        new_pattern.append(chr(arg))
+        new_pattern.append(r'[^')
+        if pattern.is_unicode:
+            new_pattern.append(unichr(arg))
+        else:
+            new_pattern.append(chr(arg))
+        new_pattern.append(r']')
     elif opcode == sre_constants.NEGATE:
         new_pattern.append(r'^')
     elif opcode == sre_constants.RANGE:
-        new_pattern.append(chr(arg[0]))
-        new_pattern.append('-')
-        new_pattern.append(chr(arg[1]))
+        if pattern.is_unicode:
+            new_pattern.append(unichr(arg[0]))
+            new_pattern.append('-')
+            new_pattern.append(unichr(arg[1]))
+        else:
+            new_pattern.append(chr(arg[0]))
+            new_pattern.append('-')
+            new_pattern.append(chr(arg[1]))
     elif opcode in (sre_constants.MIN_REPEAT, sre_constants.MAX_REPEAT):
-        new_pattern.extend(handle_repeat(opcode, arg, flags))
+        new_pattern.extend(handle_repeat(pattern, opcode, arg, flags))
     elif opcode == sre_constants.SUBPATTERN:
-        new_pattern.extend(handle_subpattern(arg, flags))
+        new_pattern.extend(handle_subpattern(pattern, arg, flags))
     elif opcode in (sre_constants.ANY, sre_constants.ANY_ALL):
         new_pattern.append('.')
     elif opcode == sre_constants.AT:
-        new_pattern.extend(handle_at(arg, flags))
+        new_pattern.extend(handle_at(pattern, arg, flags))
     elif opcode == sre_constants.CATEGORY:
-        new_pattern.extend(handle_category(arg, flags))
+        new_pattern.extend(handle_category(pattern, arg, flags))
     elif opcode == sre_constants.IN:
-        new_pattern.extend(handle_in(arg, flags))
+        new_pattern.extend(handle_in(pattern, arg, flags))
     elif opcode == sre_constants.BRANCH:
-        new_pattern.extend(handle_branch(arg, flags))
+        new_pattern.extend(handle_branch(pattern, arg, flags))
     else:
         raise UnsupportedOpcode, "Opcode %s not implemented" % opcode
     return new_pattern
 
-cdef list handle_branch(object arg, int flags):
+cdef list handle_branch(object pattern, object arg, int flags):
     cdef list new_pattern = []
+    cdef object alt = None
     cdef object alts = arg[1]
+    cdef object repeat_opcode = None
+    cdef int len_alts = len(alts)
+    cdef int n
     
-    for subop, subarg in alts:
-        new_pattern.extend(handle_op(subop, subarg, flags))
+    for n, alt in enumerate(alts):
+        if len(alt) == 0:
+            continue
+        
+        #Check for branch prefix optimizations
+        if n > 0 and len(alts[n-1]) == 0:
+            repeat_opcode = sre_constants.MIN_REPEAT
+        elif n + 1 < len_alts and len(alts[n+1]) == 0:
+            repeat_opcode = sre_constants.MAX_REPEAT
+        
+        if repeat_opcode is None:
+            for subop, subarg in alt:
+                new_pattern.extend(handle_op(pattern, subop, subarg, flags))
+        else:
+            repeat_arg = (0, 1, [(sre_constants.SUBPATTERN, (None, alt))])
+            new_pattern.extend(handle_repeat(pattern, repeat_opcode, repeat_arg, flags))
+            
         new_pattern.append(r'|')
     return new_pattern[0:-1]
 
-cdef list handle_repeat(object opcode, object arg, int flags):
+cdef list handle_repeat(object pattern, object opcode, object arg, int flags):
     cdef list new_pattern = []
+    
+    cdef int min
+    cdef int max
+    cdef object subpat
     min, max, subpat = arg
-    subop, subarg = subpat
     
     for subop, subarg in subpat:
-        new_pattern.extend(handle_op(subop, subarg, flags))
+        new_pattern.extend(handle_op(pattern, subop, subarg, flags))
     if min == 0 and max == 1:
         new_pattern.append(r'?')
     elif min == 0 and max == sre_constants.MAXREPEAT:
@@ -938,15 +991,36 @@ cdef list handle_repeat(object opcode, object arg, int flags):
     return new_pattern
     
 
-cdef list handle_subpattern(object arg, int flags):
+cdef list handle_subpattern(object pattern, object arg, int flags):
     cdef list new_pattern = []
-    emit = new_pattern.append
     groupnum, subargs = arg
+    
+    #Group opening token
+    new_pattern.append('(')
+    
+    #No groupnum implies that its a non-capturing group
+    if groupnum is None:
+        new_pattern.append('?:')
+    else:    
+        #Check if the capture group is named
+        try:
+            name = pattern.reverse_groupdict[groupnum]
+        except KeyError:
+            pass
+        else:
+            new_pattern.append(r'?P<')
+            new_pattern.append(name)
+            new_pattern.append(r'>')
+    
+    #Handle the args inside the capture group
     for opcode, subarg in subargs:
-        new_pattern.extend(handle_op(opcode, subarg, flags))
+        new_pattern.extend(handle_op(pattern, opcode, subarg, flags))
+        
+    #Group closing token
+    new_pattern.append(')')
     return new_pattern
     
-cdef list handle_at(object arg, int flags):
+cdef list handle_at(object pattern, object arg, int flags):
     cdef list new_pattern = []
     emit = new_pattern.append
     if arg in (sre_constants.AT_END_STRING, sre_constants.AT_END_LINE):
@@ -957,16 +1031,15 @@ cdef list handle_at(object arg, int flags):
         emit(r'\A')
     elif arg in (sre_constants.AT_BEGINNING, sre_constants.AT_BEGINNING_LINE):
         emit(r'^')
-    elif arg == sre_constants.AT_BOUNDRY:
+    elif arg == sre_constants.AT_BOUNDARY:
         emit(r'\b')
-    elif arg == sre_constants.AT_NON_BOUNDRY:
+    elif arg == sre_constants.AT_NON_BOUNDARY:
         emit(r'\B')
     else:
         assert False, "Unsupported AT: " + arg
     return new_pattern
         
-
-cdef list handle_category(object arg, int flags):
+cdef list handle_category(object pattern, object arg, int flags):
     cdef list new_pattern = []
     emit = new_pattern.append
     
@@ -977,7 +1050,7 @@ cdef list handle_category(object arg, int flags):
             emit(r'\w')
     elif arg == sre_constants.CATEGORY_NOT_WORD:
         if flags & _U:
-            emit(r'^_\P{L}\P{Nd}')
+            emit(r'^_\p{L}\p{Nd}')
         else:
             emit(r'\W')
     elif arg == sre_constants.CATEGORY_DIGIT:
@@ -1005,11 +1078,11 @@ cdef list handle_category(object arg, int flags):
     
     return new_pattern
 
-cdef list handle_in(object arg, int flags):
+cdef list handle_in(object pattern, object arg, int flags):
     cdef list new_pattern = []
     new_pattern.append('[')
     for opcode, subarg in arg:
-        new_pattern.extend(handle_op(opcode, subarg, flags))
+        new_pattern.extend(handle_op(pattern, opcode, subarg, flags))
     new_pattern.append(']')
     return new_pattern
     
@@ -1041,10 +1114,6 @@ def _compile(pattern, int flags=0, int max_mem=8388608):
         elif current_notification == <int>FALLBACK_WARNING:
             warnings.warn("WARNING: Using re module. Reason: %s" % error_msg)
         return re.compile(original_pattern, flags)
-        
-    # Set the options given the flags above.
-    if flags & _I:
-        opts.set_case_sensitive(0);
 
     opts.set_max_mem(max_mem)
     opts.set_log_errors(0)
